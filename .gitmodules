@@ -1,0 +1,3 @@
+[submodule "mathml-core"]
+	path = mathml-core
+	url = https://github.com/icesfont/mathml-core.git
