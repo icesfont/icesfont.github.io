@@ -3,4 +3,4 @@
 | Name                                  | Latest             |
 |---------------------------------------|--------------------|
 | [MathML Core](/mathml-core/spec.html) | largeop alignment  |
-| MathML                                | -                  |
+| MathML                                | symmetric (WIP)    |
