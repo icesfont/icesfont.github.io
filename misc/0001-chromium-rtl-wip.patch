@@ -1,0 +1,254 @@
+From d39fe79c087bff15ab23ed0670739530ceeb19ee Mon Sep 17 00:00:00 2001
+From: Harry Chen <hchen@igalia.com>
+Date: Mon, 6 Jan 2025 00:37:40 +0000
+Subject: [PATCH] chromium rtl wip
+
+---
+ .../mathml/math_operator_layout_algorithm.cc  | 18 +++--
+ .../mathml/math_radical_layout_algorithm.cc   |  3 +-
+ .../fonts/shaping/stretchy_operator_shaper.cc | 79 +++++++++++++++++--
+ .../fonts/shaping/stretchy_operator_shaper.h  |  7 +-
+ third_party/libavifinfo/src                   |  1 +
+ tools/page_cycler/acid3                       |  1 +
+ 6 files changed, 96 insertions(+), 13 deletions(-)
+ create mode 160000 third_party/libavifinfo/src
+ create mode 160000 tools/page_cycler/acid3
+
+diff --git a/third_party/blink/renderer/core/layout/mathml/math_operator_layout_algorithm.cc b/third_party/blink/renderer/core/layout/mathml/math_operator_layout_algorithm.cc
+index 01e78ce758a..e8e39a1ccd5 100644
+--- a/third_party/blink/renderer/core/layout/mathml/math_operator_layout_algorithm.cc
++++ b/third_party/blink/renderer/core/layout/mathml/math_operator_layout_algorithm.cc
+@@ -133,12 +133,18 @@ const LayoutResult* MathOperatorLayoutAlgorithm::Layout() {
+     DCHECK(element->HasBooleanProperty(MathMLOperatorElement::kLargeOp));
+     DCHECK(HasDisplayStyle(Node().Style()));
+     operator_target_size = DisplayOperatorMinHeight(Style());
++
++    if (element->HasBooleanProperty(MathMLOperatorElement::kSymmetric)) {
++      target_stretch_ascent = MathAxisHeight(Style());
++      target_stretch_descent = -target_stretch_ascent;
++    }
+   }
+ 
+   StretchyOperatorShaper shaper(
+       GetBaseCodePoint(),
+       element->IsVertical() ? OpenTypeMathStretchData::StretchAxis::Vertical
+-                            : OpenTypeMathStretchData::StretchAxis::Horizontal);
++                            : OpenTypeMathStretchData::StretchAxis::Horizontal,
++                            GetConstraintSpace().Direction());
+   StretchyOperatorShaper::Metrics metrics;
+   const ShapeResult* shape_result =
+       shaper.Shape(&Style().GetFont(), operator_target_size, &metrics);
+@@ -164,8 +170,8 @@ const LayoutResult* MathOperatorLayoutAlgorithm::Layout() {
+ 
+   LayoutUnit ascent = BorderScrollbarPadding().block_start + operator_ascent;
+   LayoutUnit descent = operator_descent + BorderScrollbarPadding().block_end;
+-  if (element->HasBooleanProperty(MathMLOperatorElement::kStretchy) &&
+-      element->IsVertical()) {
++  if ((element->HasBooleanProperty(MathMLOperatorElement::kStretchy) &&
++      element->IsVertical()) || (element->HasBooleanProperty(MathMLOperatorElement::kSymmetric) && element->HasBooleanProperty(MathMLOperatorElement::kLargeOp))) {
+     // "The stretchy glyph is shifted towards the line-under by a value Δ so
+     // that its center aligns with the center of the target"
+     LayoutUnit delta = ((operator_ascent - operator_descent) -
+@@ -199,7 +205,8 @@ MinMaxSizesResult MathOperatorLayoutAlgorithm::ComputeMinMaxSizes(
+       // § 3.2.1.1 Layout of <mtext>. Instead, we perform horizontal stretching
+       // with target size of 0 so that the size of the base glyph is used.
+       StretchyOperatorShaper shaper(GetBaseCodePoint(),
+-                                    OpenTypeMathStretchData::Horizontal);
++                                    OpenTypeMathStretchData::Horizontal,
++                                    GetConstraintSpace().Direction());
+       StretchyOperatorShaper::Metrics metrics;
+       shaper.Shape(&Style().GetFont(), 0, &metrics);
+       sizes.Encompass(LayoutUnit(metrics.advance));
+@@ -212,7 +219,8 @@ MinMaxSizesResult MathOperatorLayoutAlgorithm::ComputeMinMaxSizes(
+     // "If the operator has the largeop property and if math-style on the <mo>
+     // element is normal."
+     StretchyOperatorShaper shaper(GetBaseCodePoint(),
+-                                  OpenTypeMathStretchData::Vertical);
++                                  OpenTypeMathStretchData::Vertical,
++                                  GetConstraintSpace().Direction());
+     StretchyOperatorShaper::Metrics metrics;
+     LayoutUnit operator_target_size = DisplayOperatorMinHeight(Style());
+     shaper.Shape(&Style().GetFont(), operator_target_size, &metrics);
+diff --git a/third_party/blink/renderer/core/layout/mathml/math_radical_layout_algorithm.cc b/third_party/blink/renderer/core/layout/mathml/math_radical_layout_algorithm.cc
+index 050dcec2a63..8956c6720df 100644
+--- a/third_party/blink/renderer/core/layout/mathml/math_radical_layout_algorithm.cc
++++ b/third_party/blink/renderer/core/layout/mathml/math_radical_layout_algorithm.cc
+@@ -122,7 +122,8 @@ const LayoutResult* MathRadicalLayoutAlgorithm::Layout() {
+   if (HasBaseGlyphForRadical(Style())) {
+     // Stretch the radical operator to cover the base height.
+     StretchyOperatorShaper shaper(kSquareRootCharacter,
+-                                  OpenTypeMathStretchData::Vertical);
++                                  OpenTypeMathStretchData::Vertical,
++                                  GetConstraintSpace().Direction());
+     float target_size = base_ascent + base_descent + vertical.vertical_gap +
+                         vertical.rule_thickness;
+     const ShapeResult* shape_result =
+diff --git a/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.cc b/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.cc
+index 78ddc80b1d0..699da0d7089 100644
+--- a/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.cc
++++ b/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.cc
+@@ -7,13 +7,17 @@
+ #include <hb-ot.h>
+ #include <hb.h>
+ #include <unicode/uchar.h>
++#include <unicode/ubiditransform.h>
++#include <unicode/ushape.h>
+ 
+ #include "base/numerics/safe_conversions.h"
+ #include "third_party/blink/renderer/platform/fonts/canvas_rotation_in_vertical.h"
+ #include "third_party/blink/renderer/platform/fonts/font.h"
+ #include "third_party/blink/renderer/platform/fonts/opentype/open_type_math_support.h"
+ #include "third_party/blink/renderer/platform/fonts/shaping/harfbuzz_face.h"
++#include "third_party/blink/renderer/platform/fonts/shaping/harfbuzz_shaper.h"
+ #include "third_party/blink/renderer/platform/fonts/shaping/shape_result_inline_headers.h"
++#include "third_party/blink/renderer/platform/text/layout_locale.h"
+ #include "third_party/blink/renderer/platform/wtf/text/unicode.h"
+ #include "ui/gfx/geometry/rect_f.h"
+ #include "ui/gfx/geometry/skia_conversions.h"
+@@ -135,14 +139,79 @@ const ShapeResult* StretchyOperatorShaper::Shape(const Font* font,
+   const SimpleFontData* primary_font = font->PrimaryFont();
+   const HarfBuzzFace* harfbuzz_face =
+       primary_font->PlatformData().GetHarfBuzzFace();
+-  Glyph base_glyph = primary_font->GlyphForCharacter(stretchy_character_);
++  Glyph base_glyph;
++  // HarfBuzzShaper shaper{"."};
++  // HarfBuzzShaper::GlyphDataList glyph_data_list;
++  // shaper.GetGlyphData(*primary_font, LayoutLocale::GetDefault(), LayoutLocale::GetDefault().GetScriptForHan(), true,
++                      // glyph_data_list);
++  // for (const HarfBuzzShaper::GlyphData& glyph_data : glyph_data_list) {
++  //   base_glyph = glyph_data.glyph;
++  // }
++
++  if (direction_ == TextDirection::kRtl) {
++
++    // "If c can be mirrored, then return the glyph corresponding to the result of mirroring c."
++    // Only UChar codepoints have corresponding mirrors;
++    // see https://www.unicode.org/Public/UCD/latest/ucd/BidiMirroring.txt
++    if (stretchy_character_ <= 0xffff) {
++      UChar in[1] = {static_cast<UChar>(stretchy_character_)};
++      UChar out[1] = {0};
++      UErrorCode errorCode = U_ZERO_ERROR;
++      UBiDiTransform* transform = ubiditransform_open(&errorCode);
++      ubiditransform_transform(transform,
++        in, 1, out, 1,
++        UBIDI_LTR, UBIDI_VISUAL,
++        UBIDI_RTL, UBIDI_LOGICAL,
++        UBIDI_MIRRORING_ON,
++        U_SHAPE_DIGITS_EN2AN | U_SHAPE_DIGIT_TYPE_AN_EXTENDED,
++        &errorCode);
++      if (U_FAILURE(errorCode) || in[0] == out[0]) {
++        ubiditransform_close(transform);
++
++        // "Otherwise, if there exists an OpenType rtlm variant of the input glyph, return that."
++        hb_font_t* hb_font = harfbuzz_face->GetScaledFont();
++        hb_buffer_t* hb_buffer = hb_buffer_create();
++        hb_feature_t hb_feature = {hb_tag_from_string("rtlm", -1), 1, 0, 1};
++        hb_buffer_add(hb_buffer, stretchy_character_, 0);
++        // hb_buffer_add(hb_buffer, '[', 0);
++        hb_buffer_set_direction(hb_buffer, HB_DIRECTION_RTL);
++        hb_buffer_set_script(hb_buffer, HB_SCRIPT_COMMON);
++        hb_buffer_set_language(hb_buffer, hb_language_get_default());
++        hb_buffer_set_content_type(hb_buffer, HB_BUFFER_CONTENT_TYPE_UNICODE);
++        hb_shape(hb_font, hb_buffer, &hb_feature, 1);
++
++        unsigned int length = 1;
++        hb_glyph_info_t* hb_glyph_infos = hb_buffer_get_glyph_infos(hb_buffer, &length);
++        if (length > 0) {
++          // hb_glyph_infos[0].codepoint;
++          base_glyph = hb_glyph_infos[0].codepoint;
++          // base_glyph = primary_font->GlyphForCharacter(stretchy_character_);
++          // base_glyph = primary_font->GlyphForCharacter(0x0061);
++        }
++        else {
++          // "Otherwise, return the input glyph."
++          base_glyph = primary_font->GlyphForCharacter(stretchy_character_);
++        }
++      }
++      else {
++        base_glyph = primary_font->GlyphForCharacter(out[0]);
++      }
++    }
++    else {
++      base_glyph = primary_font->GlyphForCharacter(stretchy_character_);
++    }
++  }
++  else {
++    base_glyph = primary_font->GlyphForCharacter(stretchy_character_);
++  }
++
+   float italic_correction = 0.0;
+   if (metrics)
+     *metrics = Metrics();
+ 
+   Glyph glyph_variant;
+   float glyph_variant_stretch_size;
+-  TextDirection direction = TextDirection::kLtr;
++  // TextDirection direction = TextDirection::kLtr;
+ 
+   // Try different glyph variants.
+   for (auto& variant : OpenTypeMathSupport::GetGlyphVariantRecords(
+@@ -162,7 +231,7 @@ const ShapeResult* StretchyOperatorShaper::Shape(const Font* font,
+             : bounds.height();
+     if (glyph_variant_stretch_size >= target_size) {
+       return ShapeResult::CreateForStretchyMathOperator(
+-          font, direction, glyph_variant, glyph_variant_stretch_size);
++          font, direction_, glyph_variant, glyph_variant_stretch_size);
+     }
+   }
+ 
+@@ -172,11 +241,11 @@ const ShapeResult* StretchyOperatorShaper::Shape(const Font* font,
+                                       metrics ? &italic_correction : nullptr);
+   if (!params) {
+     return ShapeResult::CreateForStretchyMathOperator(
+-        font, direction, glyph_variant, glyph_variant_stretch_size);
++        font, direction_, glyph_variant, glyph_variant_stretch_size);
+   }
+ 
+   const ShapeResult* shape_result_for_glyph_assembly =
+-      ShapeResult::CreateForStretchyMathOperator(font, direction, stretch_axis_,
++      ShapeResult::CreateForStretchyMathOperator(font, direction_, stretch_axis_,
+                                                  std::move(*params));
+   if (metrics) {
+     // The OpenType MATH specification does provide any distinction between
+diff --git a/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.h b/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.h
+index f77e6e77157..2c2cb26a6e5 100644
+--- a/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.h
++++ b/third_party/blink/renderer/platform/fonts/shaping/stretchy_operator_shaper.h
+@@ -27,8 +27,10 @@ class PLATFORM_EXPORT StretchyOperatorShaper final {
+ 
+  public:
+   StretchyOperatorShaper(UChar32 stretchy_character,
+-                         OpenTypeMathStretchData::StretchAxis stretch_axis)
+-      : stretchy_character_(stretchy_character), stretch_axis_(stretch_axis) {}
++                         OpenTypeMathStretchData::StretchAxis stretch_axis,
++                         TextDirection direction
++                         )
++      : stretchy_character_(stretchy_character), stretch_axis_(stretch_axis), direction_(direction) {}
+ 
+   struct Metrics {
+     float advance { 0.0f };
+@@ -49,6 +51,7 @@ class PLATFORM_EXPORT StretchyOperatorShaper final {
+  private:
+   const UChar32 stretchy_character_;
+   const OpenTypeMathStretchData::StretchAxis stretch_axis_;
++  const TextDirection direction_;
+ };
+ 
+ }  // namespace blink
+diff --git a/third_party/libavifinfo/src b/third_party/libavifinfo/src
+new file mode 160000
+index 00000000000..8d8b58a3f51
+--- /dev/null
++++ b/third_party/libavifinfo/src
+@@ -0,0 +1 @@
++Subproject commit 8d8b58a3f517ef8d1794baa28ca6ae7d19f65514
+diff --git a/tools/page_cycler/acid3 b/tools/page_cycler/acid3
+new file mode 160000
+index 00000000000..a926d0a32e0
+--- /dev/null
++++ b/tools/page_cycler/acid3
+@@ -0,0 +1 @@
++Subproject commit a926d0a32e02c4c03ae95bb798e6c780e0e184ba
+-- 
+2.32.0
+
